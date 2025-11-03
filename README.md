@@ -153,7 +153,7 @@ class AOAMarkerNode(Node):
         self.declare_parameter('trail_alpha_min', 0.08)        # 很淡
         self.declare_parameter('trail_alpha_max', 0.90)        # 最亮（最新）
 
-        aoa_topic = self.get_parameter('aoa_topic').value
+        aoa_topic = self.get_parameter('').value
         marker_topic = self.get_parameter('marker_topic').value
         self._trail_topic = self.get_parameter('trail_topic').value
 
@@ -424,173 +424,115 @@ def generate_launch_description():
 
 **Next, create the aoa publisher**, replace it with the antenna aoa receiver program
 
+provide the true aoa publisher interface
+
 ```
-nano ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz/aoa_tx2rx_node.py
+nano ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz/aoa_bridge.py
+
 ```
 
 ```
-import math
-from typing import Optional
+import threading
+from typing import Callable, Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.duration import Duration
+from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import Float32
-from geometry_msgs.msg import PoseStamped
-from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 
-def yaw_from_quaternion(q):
-    # Z轴朝向的偏航角
-    ysqr = q.y * q.y
-    t3 = 2.0 * (q.w * q.z + q.x * q.y)
-    t4 = 1.0 - 2.0 * (ysqr + q.z * q.z)
-    return math.atan2(t3, t4)
 
-def wrap_to_pi(a):
-    # 归一化到 [-pi, pi]
-    a = (a + math.pi) % (2.0 * math.pi) - math.pi
-    return a
+class _AOANode(Node):
+    """Internal ROS2 node that owns the /aoa_angle publisher."""
+    def __init__(self, topic: str = "/aoa_angle", queue_size: int = 10):
+        super().__init__("aoa_bridge_node")
+        self._pub = self.create_publisher(Float32, topic, queue_size)
 
-class AOATx2RxNode(Node):
-    """
-    根据 TX 位置与机器人基座位姿，发布相对机器人朝向的 AOA 角 (rad) 到 /aoa_angle:
-      aoa = atan2(Tx_y - Rx_y, Tx_x - Rx_x) - base_yaw
-    其中 Rx 位姿从 TF(map->base_link)获取；TX 可用常量参数或订阅 /tx_pose 动态更新。
-    """
-    def __init__(self):
-        super().__init__('aoa_tx2rx_node')
+    def publish_angle(self, angle_rad: float) -> None:
+        msg = Float32()
+        msg.data = float(angle_rad)
+        self._pub.publish(msg)
+        # self.get_logger().debug(f"Published AOA: {msg.data:.6f} rad")
 
-        # 参数
-        self.declare_parameter('map_frame', 'map')
-        self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('aoa_topic', '/aoa_angle')
-        self.declare_parameter('tx_pose_topic', '/tx_pose')     # geometry_msgs/PoseStamped，可选
-        self.declare_parameter('use_tx_topic', False)           # 若 True 则使用订阅的 TX
-        self.declare_parameter('tx_x', 0.0)                     # 若不订阅，用固定 TX
-        self.declare_parameter('tx_y', 0.0)
-        self.declare_parameter('publish_rate_hz', 10.0)
 
-        self.map_frame = self.get_parameter('map_frame').value
-        self.base_frame = self.get_parameter('base_frame').value
-        self.aoa_topic = self.get_parameter('aoa_topic').value
-        self.tx_pose_topic = self.get_parameter('tx_pose_topic').value
-        self.use_tx_topic = self.get_parameter('use_tx_topic').value
+class AOAPublisher:
+    """Public interface (callee): expose publish(angle_rad)."""
+    def __init__(self, topic: str = "/aoa_angle"):
+        self._topic = topic
+        self._node: Optional[_AOANode] = None
+        self._executor: Optional[SingleThreadedExecutor] = None
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
 
-        # TF
-        self._tf_buffer = Buffer(cache_time=Duration(seconds=5.0))
-        self._tf_listener = TransformListener(self._tf_buffer, self)
+    def start(self) -> None:
+        if self._started:
+            return
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = _AOANode(topic=self._topic)
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
 
-        # 发布者
-        self.pub = self.create_publisher(Float32, self.aoa_topic, 10)
-
-        # TX 来源
-        self.tx_xy: Optional[tuple[float, float]] = None
-        if self.use_tx_topic:
-            self.create_subscription(PoseStamped, self.tx_pose_topic, self._tx_cb, 10)
-            self.get_logger().info(f'Using TX from topic: {self.tx_pose_topic}')
-        else:
-            x = float(self.get_parameter('tx_x').value)
-            y = float(self.get_parameter('tx_y').value)
-            self.tx_xy = (x, y)
-            self.get_logger().info(f'Using fixed TX: ({x:.3f}, {y:.3f}) in frame "{self.map_frame}"')
-
-        # 定时发布
-        rate = float(self.get_parameter('publish_rate_hz').value)
-        self.timer = self.create_timer(1.0 / max(1e-3, rate), self._tick)
-
-        self.get_logger().info(
-            f'Publishing AOA on {self.aoa_topic}; map="{self.map_frame}", base="{self.base_frame}", rate={rate} Hz'
-        )
-
-    def _tx_cb(self, msg: PoseStamped):
-        # 假设 TX 提供的是 map 坐标系（如非 map，可加入 tf 转换）
-        if msg.header.frame_id and msg.header.frame_id != self.map_frame:
+        def _spin():
             try:
-                # 转到 map
-                t = self._tf_buffer.lookup_transform(self.map_frame, msg.header.frame_id, rclpy.time.Time())
-                # 这里简单做平移旋转：把点转到 map（仅使用平移+Yaw）
-                # 更严谨可用 tf2_geometry_msgs，但此处点到点足够
-                # 平移
-                tx = t.transform.translation
-                # 旋转只考虑 yaw
-                yaw = yaw_from_quaternion(t.transform.rotation)
-                cos_y = math.cos(yaw)
-                sin_y = math.sin(yaw)
-                px = msg.pose.position.x
-                py = msg.pose.position.y
-                x_m = tx.x + cos_y * px - sin_y * py
-                y_m = tx.y + sin_y * px + cos_y * py
-                self.tx_xy = (x_m, y_m)
-            except (LookupException, ConnectivityException, ExtrapolationException):
-                # 转换失败，保持上一帧
+                self._executor.spin()
+            except Exception:
                 pass
-        else:
-            self.tx_xy = (msg.pose.position.x, msg.pose.position.y)
 
-    def _tick(self):
-        # 需要 TX 与 RX 位姿
-        if self.tx_xy is None:
+        self._thread = threading.Thread(target=_spin, daemon=True)
+        self._thread.start()
+        self._started = True
+
+    def publish(self, angle_rad: float) -> None:
+        if not self._started:
+            self.start()
+        assert self._node is not None
+        self._node.publish_angle(angle_rad)
+
+    def stop(self) -> None:
+        if not self._started:
             return
-        try:
-            tf = self._tf_buffer.lookup_transform(self.map_frame, self.base_frame, rclpy.time.Time())
-        except (LookupException, ConnectivityException, ExtrapolationException):
-            return
+        assert self._executor is not None and self._node is not None
+        self._executor.remove_node(self._node)
+        self._executor.shutdown()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        self._node = None
+        self._executor = None
+        self._thread = None
+        self._started = False
 
-        rx_x = tf.transform.translation.x
-        rx_y = tf.transform.translation.y
-        base_yaw = yaw_from_quaternion(tf.transform.rotation)
+    def __enter__(self):
+        self.start()
+        return self
 
-        tx_x, tx_y = self.tx_xy
-        los_yaw_global = math.atan2(tx_y - rx_y, tx_x - rx_x)  # map 中的 LOS 方向
-        aoa_rel = wrap_to_pi(los_yaw_global - base_yaw)        # 相对机体朝向
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
 
-        self.pub.publish(Float32(data=aoa_rel))
 
-def main():
-    rclpy.init()
-    node = AOATx2RxNode()
-    try:
-        rclpy.spin(node)
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+# Convenience: return a callable publish_aoa(angle_rad)
+class _PublishFnHolder:
+    _lock = threading.Lock()
+    _publisher: Optional[AOAPublisher] = None
 
-if __name__ == '__main__':
-    main()
+    @classmethod
+    def get_publish_fn(cls, topic: str = "/aoa_angle") -> Callable[[float], None]:
+        with cls._lock:
+            if cls._publisher is None:
+                cls._publisher = AOAPublisher(topic=topic)
+                cls._publisher.start()
 
-```
+        def _publish(angle_rad: float) -> None:
+            assert cls._publisher is not None
+            cls._publisher.publish(angle_rad)
 
-```
-# aoa angle publisher launch file
-nano ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz/aoa_tx2rx.launch.py
-```
+        return _publish
 
-```
-from launch import LaunchDescription
-from launch_ros.actions import Node
 
-def generate_launch_description():
-    return LaunchDescription([
-        Node(
-            package='tb4_aoa_viz',
-            executable='aoa_tx2rx_node',
-            name='aoa_tx2rx_node',
-            output='screen',
-            parameters=[
-                {'map_frame': 'map'},
-                {'base_frame': 'base_link'},
-                {'aoa_topic': '/aoa_angle'},
-                {'publish_rate_hz': 10.0},
-                # 方案一：使用固定 TX（map 坐标）
-                {'use_tx_topic': False},
-                {'tx_x': 2.5},
-                {'tx_y': -1.0},
-                # 方案二（如需）：订阅 /tx_pose
-                # {'use_tx_topic': True},
-                # {'tx_pose_topic': '/tx_pose'},
-            ]
-        )
-    ])
+def get_publish_fn(topic: str = "/aoa_angle") -> Callable[[float], None]:
+    return _PublishFnHolder.get_publish_fn(topic=topic)
 
 ```
 
@@ -762,3 +704,10 @@ export ROS_DOMAIN_ID=0
 ros2 launch tb4_aoa_viz aoa_tx2rx.launch.py
 ```
 
+
+
+
+
+
+
+mean 0, variance 3 degree every 100 ms new data.
