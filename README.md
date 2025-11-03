@@ -147,7 +147,7 @@ class AOAMarkerNode(Node):
         self.declare_parameter('trail_topic', '/aoa_trails')
         self.declare_parameter('trail_length', 10.0)          # 长线长度
         self.declare_parameter('trail_line_width', 0.02)       # 线宽(scale.x)
-        self.declare_parameter('trail_period', 3.0)            # 每隔多少秒采样一次
+        self.declare_parameter('trail_period', 6.0)            # 每隔多少秒采样一次
         self.declare_parameter('trail_capacity', 20)           # 历史线总数
         self.declare_parameter('trail_recent_fade_count', 10)  # 最新N条渐隐
         self.declare_parameter('trail_alpha_min', 0.08)        # 很淡
@@ -175,7 +175,7 @@ class AOAMarkerNode(Node):
         self._trails: Deque[Tuple[Point, Point]] = deque(maxlen=self.get_parameter('trail_capacity').value)
 
         # 定时器：箭头刷新 + 采样长线
-        self._timer = self.create_timer(0.1, self._tick_arrow)
+        self._timer = self.create_timer(1.0, self._tick_arrow)
         self._trail_timer = self.create_timer(self.get_parameter('trail_period').value, self._sample_trail)
 
         self.get_logger().info(f'AOA marker listening on {aoa_topic}, publishing {marker_topic}')
