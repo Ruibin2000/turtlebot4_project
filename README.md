@@ -153,7 +153,7 @@ class AOAMarkerNode(Node):
         self.declare_parameter('trail_alpha_min', 0.08)        # 很淡
         self.declare_parameter('trail_alpha_max', 0.90)        # 最亮（最新）
 
-        aoa_topic = self.get_parameter('').value
+        aoa_topic = self.get_parameter('aoa_topic').value
         marker_topic = self.get_parameter('marker_topic').value
         self._trail_topic = self.get_parameter('trail_topic').value
 
@@ -358,7 +358,7 @@ class AOAMarkerNode(Node):
             m.ns = 'aoa_trails'
             m.id = 100 + idx
             m.action = Marker.DELETE
-    **Next, create the ros2 marker array node publisher**        arr.markers.append(m)
+            arr.markers.append(m)
         # 也删掉箭头
         m = Marker()
         m.header.frame_id = self.get_parameter('map_frame').value
