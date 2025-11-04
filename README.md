@@ -128,6 +128,11 @@ from tf2_ros import Buffer, TransformListener
 from builtin_interfaces.msg import Duration
 
 
+def wrap_to_pi(a: float) -> float:
+    """Wrap angle to [-pi, pi]."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
 class AOAMarkerNode(Node):
     def __init__(self):
         super().__init__('aoa_marker_node')
@@ -153,9 +158,15 @@ class AOAMarkerNode(Node):
         self.declare_parameter('trail_alpha_min', 0.08)
         self.declare_parameter('trail_alpha_max', 0.90)
 
-        # ---- Added: SNR topic and threshold ----
+        # SNR topic and threshold
         self.declare_parameter('snr_topic', '/snr_db')
         self.declare_parameter('snr_threshold_db', 5.0)
+
+        # --- NEW: TX position in map frame + true-AOA gate ---
+        self.declare_parameter('tx_x', 0.0)
+        self.declare_parameter('tx_y', 0.0)
+        self.declare_parameter('aoa_abs_deg_limit', 30.0)  # degrees
+        self._aoa_abs_limit_rad = math.radians(self.get_parameter('aoa_abs_deg_limit').value)
 
         aoa_topic = self.get_parameter('aoa_topic').value
         marker_topic = self.get_parameter('marker_topic').value
@@ -188,9 +199,9 @@ class AOAMarkerNode(Node):
         self._trail_timer = self.create_timer(self.get_parameter('trail_period').value, self._sample_trail)
 
         self.get_logger().info(
-            f'AOA marker listening on {aoa_topic}, '
-            f'SNR on {self.get_parameter("snr_topic").value}, '
-            f'publishing markers to {marker_topic}'
+            f'AOA on {aoa_topic}; SNR on {self.get_parameter("snr_topic").value}; '
+            f'publishing markers to {marker_topic}; TX=({self.get_parameter("tx_x").value}, '
+            f'{self.get_parameter("tx_y").value}), limit={self.get_parameter("aoa_abs_deg_limit").value} deg'
         )
 
     # ---------- Callbacks ----------
@@ -228,20 +239,49 @@ class AOAMarkerNode(Node):
         thr = self.get_parameter('snr_threshold_db').value
         return (self._last_snr_db is not None) and (self._last_snr_db >= thr)
 
+    def _true_local_aoa_ok(self, tf) -> bool:
+        """
+        Geometry-based 'true' local AOA gate:
+        - Bearing from robot (map frame) to TX (map frame)
+        - Convert to robot-local by subtracting robot yaw
+        - Block if abs(true_local_aoa) > limit
+        """
+        tx_x = float(self.get_parameter('tx_x').value)
+        tx_y = float(self.get_parameter('tx_y').value)
+
+        # Robot pose in map frame
+        rx = tf.transform.translation.x
+        ry = tf.transform.translation.y
+        yaw = self._yaw_from_quaternion(tf.transform.rotation)
+
+        dx = tx_x - rx
+        dy = tx_y - ry
+        if dx == 0.0 and dy == 0.0:
+            # At TX position; do not block
+            return True
+
+        bearing_map = math.atan2(dy, dx)                 # [-pi, pi]
+        true_local_aoa = wrap_to_pi(bearing_map - yaw)    # local frame
+        return abs(true_local_aoa) <= self._aoa_abs_limit_rad
+
+    def _delete_arrow_only(self):
+        """Publish a DELETE for the arrow only (keep trails)."""
+        arr = MarkerArray()
+        m = Marker()
+        m.header.frame_id = self.get_parameter('map_frame').value
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'aoa'
+        m.id = 0
+        m.action = Marker.DELETE
+        arr.markers.append(m)
+        self._marker_pub.publish(arr)
+
     # ---------- Publishing ----------
     def _tick_arrow(self):
         """Update the arrow marker (runs every ~1 s)."""
-        # --- If SNR is below threshold, hide arrow but keep trails visible ---
+        # SNR gate
         if not self._snr_is_ok():
-            arr = MarkerArray()
-            m = Marker()
-            m.header.frame_id = self.get_parameter('map_frame').value
-            m.header.stamp = self.get_clock().now().to_msg()
-            m.ns = 'aoa'
-            m.id = 0
-            m.action = Marker.DELETE  # remove arrow only
-            arr.markers.append(m)
-            self._marker_pub.publish(arr)
+            self._delete_arrow_only()
             return
 
         if self._last_angle is None:
@@ -256,6 +296,11 @@ class AOAMarkerNode(Node):
 
         tf = self._lookup_base_in(map_frame, base_frame)
         if tf is None:
+            return
+
+        # True-AOA gate
+        if not self._true_local_aoa_ok(tf):
+            self._delete_arrow_only()
             return
 
         x = tf.transform.translation.x
@@ -285,15 +330,12 @@ class AOAMarkerNode(Node):
 
         arr = MarkerArray()
         arr.markers.append(arrow)
-
-        # Always refresh trails for fading effect
-        arr.markers.extend(self._build_trail_markers(map_frame))
-
+        arr.markers.extend(self._build_trail_markers(map_frame))  # keep fading refresh
         self._marker_pub.publish(arr)
 
     def _sample_trail(self):
         """Sample and add a new long trail line every trail_period seconds."""
-        # Skip adding new trails when SNR is too low
+        # SNR gate
         if not self._snr_is_ok():
             return
 
@@ -306,6 +348,10 @@ class AOAMarkerNode(Node):
 
         tf = self._lookup_base_in(map_frame, base_frame)
         if tf is None:
+            return
+
+        # True-AOA gate
+        if not self._true_local_aoa_ok(tf):
             return
 
         x = tf.transform.translation.x
@@ -435,18 +481,27 @@ def generate_launch_description():
             executable='aoa_marker_node',
             name='aoa_marker_node',
             output='screen',
-            parameters=[
-                {'angle_in_degrees': False},
-                {'aoa_topic': '/aoa_angle'},
-                {'map_frame': 'map'},
-                {'base_frame': 'base_link'},
-                {'arrow_length': 1.0},
-                {'shaft_diameter': 0.03},
-                {'head_diameter': 0.08},
-                {'head_length': 0.15},
-                {'marker_topic': '/aoa_markers'},
-            ]
-        )
+            parameters=[{
+                # Topics
+                'aoa_topic': '/aoa_angle',
+                'snr_topic': '/snr_db',
+                'marker_topic': '/aoa_markers',
+
+                # TX position in the map frame
+                'tx_x': 3.0,
+                'tx_y': 5.0,
+
+                # Thresholds
+                'snr_threshold_db': 5.0,
+                'aoa_abs_deg_limit': 30.0,
+
+                # Visualization
+                'arrow_length': 1.0,
+                'trail_length': 10.0,
+                'trail_period': 6.0,
+                'trail_capacity': 20,
+            }]
+        ),
     ])
 
 ```
