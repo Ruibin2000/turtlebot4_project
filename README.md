@@ -308,7 +308,7 @@ class AOAMarkerNode(Node):
 
             # 颜色：后半段（最老的那部分）固定很淡；最新的 recent_n 条做线性渐隐
             # deque: 0..n-1 = old..new
-            # old_count = max(0, n - recent_n)
+            # old_count = max(0, n - re'rplidar_link' at time 1762216436.012 for reason 'discarding message because thcent_n)
             old_count = max(0, n - recent_n)
             if idx < old_count:
                 alpha = alpha_min  # 老的：恒定很淡
@@ -422,7 +422,7 @@ def generate_launch_description():
 
 ```
 
-**Next, create the aoa publisher**, replace it with the antenna aoa receiver program
+**Next, create the ros2 publishers**, replace it with the antenna aoa receiver program
 
 provide the true aoa publisher interface
 
@@ -432,6 +432,9 @@ nano ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz/aoa_bridge.py
 ```
 
 ```
+#!/usr/bin/env python3
+# Lightweight ROS 2 publishing bridge for AOA (Float32, radians).
+
 import threading
 from typing import Callable, Optional
 
@@ -442,7 +445,7 @@ from std_msgs.msg import Float32
 
 
 class _AOANode(Node):
-    """Internal ROS2 node that owns the /aoa_angle publisher."""
+    """Internal node that owns the /aoa_angle publisher."""
     def __init__(self, topic: str = "/aoa_angle", queue_size: int = 10):
         super().__init__("aoa_bridge_node")
         self._pub = self.create_publisher(Float32, topic, queue_size)
@@ -451,11 +454,10 @@ class _AOANode(Node):
         msg = Float32()
         msg.data = float(angle_rad)
         self._pub.publish(msg)
-        # self.get_logger().debug(f"Published AOA: {msg.data:.6f} rad")
 
 
 class AOAPublisher:
-    """Public interface (callee): expose publish(angle_rad)."""
+    """Callee: expose publish(angle_rad); manages rclpy + executor thread."""
     def __init__(self, topic: str = "/aoa_angle"):
         self._topic = topic
         self._node: Optional[_AOANode] = None
@@ -513,28 +515,145 @@ class AOAPublisher:
 
 
 # Convenience: return a callable publish_aoa(angle_rad)
-class _PublishFnHolder:
+class _PublishAOAFnHolder:
     _lock = threading.Lock()
     _publisher: Optional[AOAPublisher] = None
 
     @classmethod
-    def get_publish_fn(cls, topic: str = "/aoa_angle") -> Callable[[float], None]:
+    def get_publish_aoa_fn(cls, topic: str = "/aoa_angle") -> Callable[[float], None]:
         with cls._lock:
             if cls._publisher is None:
                 cls._publisher = AOAPublisher(topic=topic)
                 cls._publisher.start()
 
-        def _publish(angle_rad: float) -> None:
+        def publish_aoa(angle_rad: float) -> None:
             assert cls._publisher is not None
             cls._publisher.publish(angle_rad)
 
-        return _publish
+        return publish_aoa
 
 
-def get_publish_fn(topic: str = "/aoa_angle") -> Callable[[float], None]:
-    return _PublishFnHolder.get_publish_fn(topic=topic)
+def get_publish_aoa_fn(topic: str = "/aoa_angle") -> Callable[[float], None]:
+    """Usage: publish_aoa = get_publish_aoa_fn(); publish_aoa(angle_rad)"""
+    return _PublishAOAFnHolder.get_publish_aoa_fn(topic=topic)
 
 ```
+
+provide the true snr publisher interface
+
+```
+nano ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz/snr_bridge.py
+```
+
+```
+#!/usr/bin/env python3
+# Lightweight ROS 2 publishing bridge for SNR (Float32, dB).
+
+import threading
+from typing import Callable, Optional
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+from std_msgs.msg import Float32
+
+
+class _SNRNode(Node):
+    """Internal node that owns the /snr_db publisher."""
+    def __init__(self, topic: str = "/snr_db", queue_size: int = 10):
+        super().__init__("snr_bridge_node")
+        self._pub = self.create_publisher(Float32, topic, queue_size)
+
+    def publish_snr_db(self, snr_db: float) -> None:
+        msg = Float32()
+        msg.data = float(snr_db)
+        self._pub.publish(msg)
+
+
+class SNRPublisher:
+    """Callee: expose publish(snr_db); manages rclpy + executor thread."""
+    def __init__(self, topic: str = "/snr_db"):
+        self._topic = topic
+        self._node: Optional[_SNRNode] = None
+        self._executor: Optional[SingleThreadedExecutor] = None
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = _SNRNode(topic=self._topic)
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+
+        def _spin():
+            try:
+                self._executor.spin()
+            except Exception:
+                pass
+
+        self._thread = threading.Thread(target=_spin, daemon=True)
+        self._thread.start()
+        self._started = True
+
+    def publish(self, snr_db: float) -> None:
+        if not self._started:
+            self.start()
+        assert self._node is not None
+        self._node.publish_snr_db(snr_db)
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        assert self._executor is not None and self._node is not None
+        self._executor.remove_node(self._node)
+        self._executor.shutdown()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        self._node = None
+        self._executor = None
+        self._thread = None
+        self._started = False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+
+
+# Convenience: return a callable publish_snr(snr_db)
+class _PublishSNRFnHolder:
+    _lock = threading.Lock()
+    _publisher: Optional[SNRPublisher] = None
+
+    @classmethod
+    def get_publish_snr_fn(cls, topic: str = "/snr_db") -> Callable[[float], None]:
+        with cls._lock:
+            if cls._publisher is None:
+                cls._publisher = SNRPublisher(topic=topic)
+                cls._publisher.start()
+
+        def publish_snr(snr_db: float) -> None:
+            assert cls._publisher is not None
+            cls._publisher.publish(snr_db)
+
+        return publish_snr
+
+
+def get_publish_snr_fn(topic: str = "/snr_db") -> Callable[[float], None]:
+    """Usage: publish_snr = get_publish_snr_fn(); publish_snr(snr_db)"""
+    return _PublishSNRFnHolder.get_publish_snr_fn(topic=topic)
+
+```
+
+
 
 **Build**
 
@@ -581,7 +700,9 @@ unset CYCLONEDDS_URI
 export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
 
 source /opt/ros/jazzy/setup.bash
-ros2 daemon stop; ros2 daemon start
+ros2 daemon stop
+ros2 daemon cleanup
+ros2 daemon start
 
 ```
 
@@ -595,7 +716,9 @@ unset CYCLONEDDS_URI
 export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
 
 source /opt/ros/jazzy/setup.bash
-ros2 daemon stop; ros2 daemon start
+ros2 daemon stop
+ros2 daemon cleanup
+ros2 daemon start
 ```
 
 **backup**
@@ -706,7 +829,12 @@ ros2 launch tb4_aoa_viz aoa_tx2rx.launch.py
 
 
 
+### Commend for FPV camera stream
 
+```
+source /opt/ros/jazzy/setup.bash
+rqt
+```
 
 
 
