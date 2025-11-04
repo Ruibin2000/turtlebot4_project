@@ -911,6 +911,16 @@ export ROS_DOMAIN_ID=0
 ros2 launch tb4_aoa_viz aoa_tx2rx.launch.py
 ```
 
+commend to set Tx location
+
+```
+ros2 param set /aoa_marker_node tx_x 3.27
+ros2 param set /aoa_marker_node tx_y -1.45
+
+```
+
+
+
 
 
 ### Commend for FPV camera stream
