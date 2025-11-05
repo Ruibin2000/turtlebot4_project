@@ -115,13 +115,18 @@ nano ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz/aoa_marker_node.py
 ```
 
 ```
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import math
 from collections import deque
-from typing import Optional, Deque, Tuple
+from typing import Optional, Deque, Tuple, List
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from rclpy.duration import Duration as RclpyDuration
+from rcl_interfaces.msg import SetParametersResult
+
+from std_msgs.msg import Float32, Bool
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from tf2_ros import Buffer, TransformListener
@@ -129,127 +134,201 @@ from builtin_interfaces.msg import Duration
 
 
 def wrap_to_pi(a: float) -> float:
-    """Wrap angle to [-pi, pi]."""
+    """Wrap angle to [-pi, pi].."""
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
 class AOAMarkerNode(Node):
+    """
+    AOA + SNR 可视化节点（无固定 SNR 门限；有异常突降屏蔽；轨迹按真实时间衰减）。
+
+    - 角度门限：仅当“真本地AOA” |aoa| <= aoa_abs_deg_limit 才绘制箭头/轨迹
+    - SNR 突降（基于滑窗中位数+MAD）：在 snr_hold_sec 抑制期内屏蔽绘制
+    - 轨迹渐隐：每条线段记录时间戳，按指数衰减（半衰期 fade_half_life_sec），到期移除
+    """
+
+    _last_published_trail_count: int = 0  # 兼容删除旧ID（可留作保险）
+
     def __init__(self):
         super().__init__('aoa_marker_node')
 
-        # ---- Parameters ----
+        # 话题/帧/单位
         self.declare_parameter('aoa_topic', '/aoa_angle')
+        self.declare_parameter('snr_topic', '/snr_db')
+        self.declare_parameter('marker_topic', '/aoa_markers')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('angle_in_degrees', False)
+
+        # 几何门限 & TX 位置
+        self.declare_parameter('tx_x', 0.0)
+        self.declare_parameter('tx_y', 0.0)
+        self.declare_parameter('aoa_abs_deg_limit', 30.0)
+
+        # 箭头样式
         self.declare_parameter('arrow_length', 1.0)
         self.declare_parameter('shaft_diameter', 0.03)
         self.declare_parameter('head_diameter', 0.08)
         self.declare_parameter('head_length', 0.15)
-        self.declare_parameter('angle_in_degrees', False)
-        self.declare_parameter('marker_topic', '/aoa_markers')
 
-        # Trail (historical lines) parameters
-        self.declare_parameter('trail_topic', '/aoa_trails')
-        self.declare_parameter('trail_length', 10.0)
+        # 轨迹采样与样式（不再用“容量内新旧渐隐”，而是按真实时间衰减）
+        self.declare_parameter('trail_period', 6.0)          # 采样间隔（秒）
+        self.declare_parameter('trail_length', 10.0)         # 每条线段长度（米）
         self.declare_parameter('trail_line_width', 0.02)
-        self.declare_parameter('trail_period', 6.0)
-        self.declare_parameter('trail_capacity', 20)
-        self.declare_parameter('trail_recent_fade_count', 10)
-        self.declare_parameter('trail_alpha_min', 0.08)
-        self.declare_parameter('trail_alpha_max', 0.90)
+        self.declare_parameter('trail_alpha_max', 0.90)      # 新线段初始不透明度
+        self.declare_parameter('trail_fade_half_life_sec', 20.0)  # 半衰期，越小衰减越快
+        self.declare_parameter('trail_max_age_sec', 60.0)    # 超龄自动删除
+        self.declare_parameter('trail_capacity', 200)        # 上限，防止无限增长
 
-        # SNR topic and threshold
-        self.declare_parameter('snr_topic', '/snr_db')
-        self.declare_parameter('snr_threshold_db', 5.0)
+        # SNR 异常突降检测（滑窗 + 中位数 + MAD）
+        self.declare_parameter('snr_outlier_enable', True)
+        self.declare_parameter('snr_window_sec', 5.0)
+        self.declare_parameter('snr_min_samples', 5)
+        self.declare_parameter('snr_drop_db', 3.0)           # 绝对跌落阈值
+        self.declare_parameter('snr_k_mad', 2.5)             # MAD 倍数阈值
+        self.declare_parameter('snr_rel_drop_frac', 0.30)    # 相对跌落比例阈值
+        self.declare_parameter('snr_hold_sec', 2.0)          # 判定异常后的抑制时间
 
-        # --- NEW: TX position in map frame + true-AOA gate ---
-        self.declare_parameter('tx_x', 0.0)
-        self.declare_parameter('tx_y', 0.0)
-        self.declare_parameter('aoa_abs_deg_limit', 30.0)  # degrees
-        self._aoa_abs_limit_rad = math.radians(self.get_parameter('aoa_abs_deg_limit').value)
-
-        aoa_topic = self.get_parameter('aoa_topic').value
-        marker_topic = self.get_parameter('marker_topic').value
-        self._trail_topic = self.get_parameter('trail_topic').value
-
-        # ---- ROS I/O ----
+        # ROS I/O
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
-        self._aoa_sub = self.create_subscription(Float32, aoa_topic, self._aoa_cb, 10)
 
-        # SNR subscriber
+        self._aoa_sub = self.create_subscription(
+            Float32, self.get_parameter('aoa_topic').value, self._aoa_cb, 10
+        )
         self._snr_sub = self.create_subscription(
-            Float32,
-            self.get_parameter('snr_topic').value,
-            self._snr_cb,
-            10
+            Float32, self.get_parameter('snr_topic').value, self._snr_cb, 10
         )
 
-        self._marker_pub = self.create_publisher(MarkerArray, marker_topic, 10)
+        self._marker_pub = self.create_publisher(
+            MarkerArray, self.get_parameter('marker_topic').value, 10
+        )
+        # 诊断输出（可在 RViz/PlotJuggler 观察）
+        self._snr_outlier_pub = self.create_publisher(Bool, '/snr_outlier', 10)
+        self._snr_median_pub  = self.create_publisher(Float32, '/snr_median', 10)
 
-        self._last_angle: Optional[float] = None
+        # 运行态
+        self._last_angle: Optional[float] = None  # 弧度
         self._last_snr_db: Optional[float] = None
         self._last_tf_ok = False
 
-        # Trail deque: stores tuples (p0, p1)
-        self._trails: Deque[Tuple[Point, Point]] = deque(maxlen=self.get_parameter('trail_capacity').value)
+        # SNR 历史 & 抑制计时
+        self._snr_hist: Deque[Tuple[float, float]] = deque()  # (t_sec, snr_db)
+        self._snr_outlier_until: float = 0.0
 
-        # Timers: arrow update and trail sampling
+        # 轨迹：[(p0, p1, t_birth_sec)]
+        self._trails: List[Tuple[Point, Point, float]] = []
+
+        # 定时器：箭头刷新 + 轨迹采样
         self._timer = self.create_timer(1.0, self._tick_arrow)
-        self._trail_timer = self.create_timer(self.get_parameter('trail_period').value, self._sample_trail)
-
-        self.get_logger().info(
-            f'AOA on {aoa_topic}; SNR on {self.get_parameter("snr_topic").value}; '
-            f'publishing markers to {marker_topic}; TX=({self.get_parameter("tx_x").value}, '
-            f'{self.get_parameter("tx_y").value}), limit={self.get_parameter("aoa_abs_deg_limit").value} deg'
+        self._trail_timer = self.create_timer(
+            float(self.get_parameter('trail_period').value), self._sample_trail
         )
 
-    # ---------- Callbacks ----------
+        # 动态参数回调（支持运行期更新）
+        self.add_on_set_parameters_callback(self._on_set_params)
+
+        self.get_logger().info(
+            f"AOA:{self.get_parameter('aoa_topic').value}  "
+            f"SNR:{self.get_parameter('snr_topic').value}  "
+            f"Markers->{self.get_parameter('marker_topic').value}  "
+            f"TX=({self.get_parameter('tx_x').value}, {self.get_parameter('tx_y').value})  "
+            f"AOA limit={self.get_parameter('aoa_abs_deg_limit').value} deg"
+        )
+
+    # ---------------- 参数回调 ----------------
+    def _on_set_params(self, params) -> SetParametersResult:
+        try:
+            for p in params:
+                if p.name == 'trail_period':
+                    period = max(0.1, float(p.value))
+                    try:
+                        self._trail_timer.cancel()
+                    except Exception:
+                        pass
+                    self._trail_timer = self.create_timer(period, self._sample_trail)
+                elif p.name == 'trail_capacity':
+                    cap = int(p.value)
+                    if cap <= 0:
+                        cap = 1
+                    # 若当前超出新上限，裁掉最旧的
+                    if len(self._trails) > cap:
+                        self._trails = self._trails[-cap:]
+                # 其余参数实时读取，无需额外处理
+            return SetParametersResult(successful=True)
+        except Exception as e:
+            return SetParametersResult(successful=False, reason=str(e))
+
+    # ---------------- 订阅回调 ----------------
     def _aoa_cb(self, msg: Float32):
-        """Receive AOA (angle of arrival)."""
-        angle = math.radians(msg.data) if self.get_parameter('angle_in_degrees').value else msg.data
-        self._last_angle = angle
+        """接收 AOA。按参数决定是否把度转为弧度。"""
+        if self.get_parameter('angle_in_degrees').value:
+            self._last_angle = math.radians(float(msg.data))
+        else:
+            self._last_angle = float(msg.data)
 
     def _snr_cb(self, msg: Float32):
-        """Receive SNR value (in dB)."""
+        """接收 SNR(dB)，记录到滑动窗口并做异常检测。"""
         self._last_snr_db = float(msg.data)
+        t_now = self._now_sec()
+        self._snr_hist.append((t_now, self._last_snr_db))
 
-    # ---------- Helpers ----------
-    def _yaw_from_quaternion(self, q):
-        """Convert quaternion to yaw (Z rotation)."""
+        # 修剪窗口
+        win = float(self.get_parameter('snr_window_sec').value)
+        while self._snr_hist and (t_now - self._snr_hist[0][0] > win):
+            self._snr_hist.popleft()
+
+        # 更新 outlier 标志
+        self._update_snr_outlier_flag(t_now)
+
+    # ---------------- 工具函数 ----------------
+    def _now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _yaw_from_quaternion(self, q) -> float:
+        """Quaternion -> yaw(rad)."""
         ysqr = q.y * q.y
         t3 = 2.0 * (q.w * q.z + q.x * q.y)
         t4 = 1.0 - 2.0 * (ysqr + q.z * q.z)
         return math.atan2(t3, t4)
 
     def _lookup_base_in(self, map_frame: str, base_frame: str):
-        """Try to get the transform of base_frame in map_frame."""
+        """尝试查 map->base_frame TF（带超时预检查）。"""
         try:
-            tf = self._tf_buffer.lookup_transform(map_frame, base_frame, rclpy.time.Time())
+            if not self._tf_buffer.can_transform(
+                map_frame, base_frame, rclpy.time.Time(), timeout=RclpyDuration(seconds=0.2)
+            ):
+                if self._last_tf_ok:
+                    self.get_logger().warn('TF not available: map -> %s' % base_frame)
+                self._last_tf_ok = False
+                return None
+            tf = self._tf_buffer.lookup_transform(
+                map_frame, base_frame, rclpy.time.Time(), timeout=RclpyDuration(seconds=0.2)
+            )
             self._last_tf_ok = True
             return tf
         except Exception as e:
             if self._last_tf_ok:
-                self.get_logger().warn(f'lookup_transform({map_frame}->{base_frame}) failed once: {e}')
+                self.get_logger().warn(f'lookup_transform({map_frame}->{base_frame}) failed: {e}')
             self._last_tf_ok = False
             return None
 
-    def _snr_is_ok(self) -> bool:
-        """Return True if SNR is above threshold."""
-        thr = self.get_parameter('snr_threshold_db').value
-        return (self._last_snr_db is not None) and (self._last_snr_db >= thr)
+    def _snr_drop_blocked(self) -> bool:
+        """是否处于 SNR 异常突降的抑制期."""
+        if not self.get_parameter('snr_outlier_enable').value:
+            return False
+        return self._now_sec() < self._snr_outlier_until
 
     def _true_local_aoa_ok(self, tf) -> bool:
         """
-        Geometry-based 'true' local AOA gate:
-        - Bearing from robot (map frame) to TX (map frame)
-        - Convert to robot-local by subtracting robot yaw
-        - Block if abs(true_local_aoa) > limit
+        几何“真-AOA”门限：
+        - map中机器人到TX的方位角 bearing_map
+        - 减去机器人 yaw 得到 true_local_aoa（本地）
+        - 与 aoa_abs_deg_limit 比较
         """
         tx_x = float(self.get_parameter('tx_x').value)
         tx_y = float(self.get_parameter('tx_y').value)
 
-        # Robot pose in map frame
         rx = tf.transform.translation.x
         ry = tf.transform.translation.y
         yaw = self._yaw_from_quaternion(tf.transform.rotation)
@@ -257,15 +336,16 @@ class AOAMarkerNode(Node):
         dx = tx_x - rx
         dy = tx_y - ry
         if dx == 0.0 and dy == 0.0:
-            # At TX position; do not block
             return True
 
-        bearing_map = math.atan2(dy, dx)                 # [-pi, pi]
-        true_local_aoa = wrap_to_pi(bearing_map - yaw)    # local frame
-        return abs(true_local_aoa) <= self._aoa_abs_limit_rad
+        bearing_map = math.atan2(dy, dx)
+        true_local_aoa = wrap_to_pi(bearing_map - yaw)
+
+        limit_rad = math.radians(float(self.get_parameter('aoa_abs_deg_limit').value))
+        return abs(true_local_aoa) <= limit_rad
 
     def _delete_arrow_only(self):
-        """Publish a DELETE for the arrow only (keep trails)."""
+        """仅删除箭头（轨迹靠刷新/到期删除）。"""
         arr = MarkerArray()
         m = Marker()
         m.header.frame_id = self.get_parameter('map_frame').value
@@ -276,156 +356,211 @@ class AOAMarkerNode(Node):
         arr.markers.append(m)
         self._marker_pub.publish(arr)
 
-    # ---------- Publishing ----------
+    # ---------------- 定时刷新箭头 ----------------
     def _tick_arrow(self):
-        """Update the arrow marker (runs every ~1 s)."""
-        # SNR gate
-        if not self._snr_is_ok():
-            self._delete_arrow_only()
-            return
-
-        if self._last_angle is None:
-            return
-
-        map_frame = self.get_parameter('map_frame').value
-        base_frame = self.get_parameter('base_frame').value
-        L = self.get_parameter('arrow_length').value
-        shaft_d = self.get_parameter('shaft_diameter').value
-        head_d = self.get_parameter('head_diameter').value
-        head_L = self.get_parameter('head_length').value
-
-        tf = self._lookup_base_in(map_frame, base_frame)
-        if tf is None:
-            return
-
-        # True-AOA gate
-        if not self._true_local_aoa_ok(tf):
-            self._delete_arrow_only()
-            return
-
-        x = tf.transform.translation.x
-        y = tf.transform.translation.y
-        base_yaw = self._yaw_from_quaternion(tf.transform.rotation)
-
-        theta = base_yaw + self._last_angle
-        p0 = Point(x=x, y=y, z=0.1)
-        p1 = Point(x=x + L * math.cos(theta), y=y + L * math.sin(theta), z=0.1)
-
-        arrow = Marker()
-        arrow.header.frame_id = map_frame
-        arrow.header.stamp = self.get_clock().now().to_msg()
-        arrow.ns = 'aoa'
-        arrow.id = 0
-        arrow.type = Marker.ARROW
-        arrow.action = Marker.ADD
-        arrow.points = [p0, p1]
-        arrow.scale.x = shaft_d
-        arrow.scale.y = head_d
-        arrow.scale.z = head_L
-        arrow.color.r = 1.0
-        arrow.color.g = 0.2
-        arrow.color.b = 0.0
-        arrow.color.a = 1.0
-        arrow.lifetime = Duration(sec=0, nanosec=0)
+        """每 ~1s 更新箭头，同时刷新轨迹透明度并删除过期线段。"""
+        # 处于 SNR outlier 抑制期：不画箭头，但仍刷新/清理轨迹
+        blocked = self._snr_drop_blocked()
 
         arr = MarkerArray()
-        arr.markers.append(arrow)
-        arr.markers.extend(self._build_trail_markers(map_frame))  # keep fading refresh
+
+        if not blocked and self._last_angle is not None:
+            map_frame = self.get_parameter('map_frame').value
+            base_frame = self.get_parameter('base_frame').value
+
+            tf = self._lookup_base_in(map_frame, base_frame)
+            if tf is not None and self._true_local_aoa_ok(tf):
+                # 绘制箭头
+                L = float(self.get_parameter('arrow_length').value)
+                shaft_d = float(self.get_parameter('shaft_diameter').value)
+                head_d = float(self.get_parameter('head_diameter').value)
+                head_L = float(self.get_parameter('head_length').value)
+
+                x = tf.transform.translation.x
+                y = tf.transform.translation.y
+                base_yaw = self._yaw_from_quaternion(tf.transform.rotation)
+                theta = base_yaw + self._last_angle
+
+                p0 = Point(x=x, y=y, z=0.1)
+                p1 = Point(x=x + L * math.cos(theta), y=y + L * math.sin(theta), z=0.1)
+
+                arrow = Marker()
+                arrow.header.frame_id = map_frame
+                arrow.header.stamp = self.get_clock().now().to_msg()
+                arrow.ns = 'aoa'
+                arrow.id = 0
+                arrow.type = Marker.ARROW
+                arrow.action = Marker.ADD
+                arrow.points = [p0, p1]
+                arrow.scale.x = shaft_d
+                arrow.scale.y = head_d
+                arrow.scale.z = head_L
+                arrow.color.r = 1.0
+                arrow.color.g = 0.2
+                arrow.color.b = 0.0
+                arrow.color.a = 1.0
+                arrow.lifetime = Duration(sec=0, nanosec=0)
+                arr.markers.append(arrow)
+            else:
+                # 条件不满足：删除箭头
+                m = Marker()
+                m.header.frame_id = self.get_parameter('map_frame').value
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = 'aoa'
+                m.id = 0
+                m.action = Marker.DELETE
+                arr.markers.append(m)
+        else:
+            # 被 outlier 抑制：删除箭头
+            m = Marker()
+            m.header.frame_id = self.get_parameter('map_frame').value
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = 'aoa'
+            m.id = 0
+            m.action = Marker.DELETE
+            arr.markers.append(m)
+
+        # 刷新/构建轨迹（按真实时间衰减 & 到期删除）
+        arr.markers.extend(self._build_time_fading_trails())
         self._marker_pub.publish(arr)
 
+    # ---------------- 轨迹采样 ----------------
     def _sample_trail(self):
-        """Sample and add a new long trail line every trail_period seconds."""
-        # SNR gate
-        if not self._snr_is_ok():
-            return
-
-        if self._last_angle is None:
+        """按 trail_period 采样一条线段，加入轨迹队列（若未被 outlier 抑制且满足角度门限）。"""
+        if self._snr_drop_blocked() or self._last_angle is None:
             return
 
         map_frame = self.get_parameter('map_frame').value
         base_frame = self.get_parameter('base_frame').value
-        LL = self.get_parameter('trail_length').value
-
         tf = self._lookup_base_in(map_frame, base_frame)
-        if tf is None:
+        if tf is None or not self._true_local_aoa_ok(tf):
             return
 
-        # True-AOA gate
-        if not self._true_local_aoa_ok(tf):
-            return
-
+        LL = float(self.get_parameter('trail_length').value)
         x = tf.transform.translation.x
         y = tf.transform.translation.y
         base_yaw = self._yaw_from_quaternion(tf.transform.rotation)
         theta = base_yaw + self._last_angle
 
-        p0 = Point(x=x, y=y, z=0.02)  # slightly lower than the arrow
+        p0 = Point(x=x, y=y, z=0.02)
         p1 = Point(x=x + LL * math.cos(theta), y=y + LL * math.sin(theta), z=0.02)
 
-        self._trails.append((p0, p1))
+        # 容量控制（防爆）
+        cap = int(self.get_parameter('trail_capacity').value)
+        if cap <= 0:
+            cap = 1
+        if len(self._trails) >= cap:
+            self._trails = self._trails[-(cap - 1):]  # 丢最旧
 
-        arr = MarkerArray()
-        arr.markers.extend(self._build_trail_markers(map_frame))
-        self._marker_pub.publish(arr)
+        self._trails.append((p0, p1, self._now_sec()))
 
-    def _build_trail_markers(self, frame_id: str):
-        """Build fading trail markers based on history."""
-        trail_width = self.get_parameter('trail_line_width').value
-        cap = self.get_parameter('trail_capacity').value
-        recent_n = min(self.get_parameter('trail_recent_fade_count').value, cap)
-        alpha_min = self.get_parameter('trail_alpha_min').value
-        alpha_max = self.get_parameter('trail_alpha_max').value
+    # ---------------- 按真实时间渐隐的轨迹构建 ----------------
+    def _build_time_fading_trails(self) -> List[Marker]:
+        """
+        为每条历史线段基于 age 计算透明度：
+            alpha(age) = trail_alpha_max * 0.5 ** ( age / half_life )
+        超过 trail_max_age_sec 的线段会被删除，不再发布。
+        """
+        trail_width = float(self.get_parameter('trail_line_width').value)
+        alpha_max = float(self.get_parameter('trail_alpha_max').value)
+        half_life = max(1e-3, float(self.get_parameter('trail_fade_half_life_sec').value))
+        max_age = max(half_life, float(self.get_parameter('trail_max_age_sec').value))
 
-        markers = []
+        now = self._now_sec()
+        survivors: List[Tuple[Point, Point, float]] = []
+        markers: List[Marker] = []
 
-        n = len(self._trails)
-        old_count = max(0, n - recent_n)
-        for idx, (p0, p1) in enumerate(self._trails):
+        for idx, (p0, p1, t_birth) in enumerate(self._trails):
+            age = now - t_birth
+            if age > max_age:
+                continue  # 删除超龄
+            # 指数衰减
+            alpha = alpha_max * (0.5 ** (age / half_life))
+            # 下限裁剪（避免过暗渲染开销），也可以让其直接删除
+            if alpha < 0.02:
+                continue
+
             m = Marker()
-            m.header.frame_id = frame_id
+            m.header.frame_id = self.get_parameter('map_frame').value
             m.header.stamp = self.get_clock().now().to_msg()
             m.ns = 'aoa_trails'
-            m.id = 100 + idx  # unique ID for each line
+            m.id = 100 + idx  # 仅用于 RViz 缓存；索引变化时不影响显示
             m.type = Marker.LINE_LIST
             m.action = Marker.ADD
             m.points = [p0, p1]
             m.scale.x = trail_width
-
-            # Older trails are faint; newer ones are brighter
-            if idx < old_count:
-                alpha = alpha_min
-            else:
-                rank = idx - old_count
-                t = (rank) / (recent_n - 1) if recent_n > 1 else 1.0
-                alpha = alpha_min + (alpha_max - alpha_min) * t
-
             m.color.r = 1.0
             m.color.g = 0.5
             m.color.b = 0.0
             m.color.a = float(alpha)
             m.lifetime = Duration(sec=0, nanosec=0)
             markers.append(m)
+            survivors.append((p0, p1, t_birth))
 
-        # Delete markers if capacity decreases
-        if n < self._last_published_trail_count:
-            for idx in range(n, self._last_published_trail_count):
+        # 用剩余的覆盖（完成“删除超龄/超暗”）
+        self._trails = survivors
+
+        # （兼容处理：若数量下降，删除多余ID——通常无需，但保留以防 RViz 残影）
+        if len(self._trails) < self._last_published_trail_count:
+            for kill in range(len(self._trails), self._last_published_trail_count):
                 m = Marker()
-                m.header.frame_id = frame_id
+                m.header.frame_id = self.get_parameter('map_frame').value
                 m.header.stamp = self.get_clock().now().to_msg()
                 m.ns = 'aoa_trails'
-                m.id = 100 + idx
+                m.id = 100 + kill
                 m.action = Marker.DELETE
                 markers.append(m)
-
-        self._last_published_trail_count = n
+        self._last_published_trail_count = len(self._trails)
         return markers
 
-    # ---------- Lifecycle ----------
+    # ---------------- SNR 异常突降检测 ----------------
+    def _update_snr_outlier_flag(self, t_now: float):
+        if not self.get_parameter('snr_outlier_enable').value:
+            self._snr_outlier_pub.publish(Bool(data=False))
+            return
+
+        min_n = int(self.get_parameter('snr_min_samples').value)
+        if len(self._snr_hist) < max(2, min_n):
+            self._snr_outlier_pub.publish(Bool(data=False))
+            return
+
+        vals = [v for (_, v) in self._snr_hist]
+        vals_sorted = sorted(vals)
+        n = len(vals_sorted)
+        med = vals_sorted[n // 2] if n % 2 == 1 else 0.5 * (vals_sorted[n//2 - 1] + vals_sorted[n//2])
+
+        abs_dev = [abs(v - med) for v in vals_sorted]
+        abs_dev_sorted = sorted(abs_dev)
+        mad = abs_dev_sorted[n // 2] if n % 2 == 1 else 0.5 * (abs_dev_sorted[n//2 - 1] + abs_dev_sorted[n//2])
+        sigma_robust = 1.4826 * mad
+
+        snr_now = vals[-1]
+        drop_db = float(self.get_parameter('snr_drop_db').value)
+        k_mad = float(self.get_parameter('snr_k_mad').value)
+        rel_frac = float(self.get_parameter('snr_rel_drop_frac').value)
+
+        cond_abs = (med - snr_now) >= drop_db
+        cond_rel = (med > 1e-6) and ((med - snr_now) / max(1e-6, med) >= rel_frac)
+        cond_mad = (sigma_robust > 0.0) and ((med - snr_now) >= k_mad * sigma_robust)
+
+        is_outlier = bool(cond_abs or cond_rel or cond_mad)
+        if is_outlier:
+            hold = float(self.get_parameter('snr_hold_sec').value)
+            self._snr_outlier_until = max(self._snr_outlier_until, t_now + hold)
+            self.get_logger().debug(
+                f"SNR outlier: now={snr_now:.2f} dB, med={med:.2f} dB, "
+                f"drop={med - snr_now:.2f} dB, sigma~={sigma_robust:.2f}, hold={hold}s"
+            )
+
+        self._snr_outlier_pub.publish(Bool(data=is_outlier or (t_now < self._snr_outlier_until)))
+        self._snr_median_pub.publish(Float32(data=float(med)))
+
+    # ---------------- 生命周期 ----------------
     def on_shutdown(self):
-        """Clean up all markers when shutting down."""
+        """退出前清理所有 Marker。"""
         arr = MarkerArray()
 
-        # Delete the arrow
+        # 删除箭头
         m0 = Marker()
         m0.header.frame_id = self.get_parameter('map_frame').value
         m0.header.stamp = self.get_clock().now().to_msg()
@@ -434,7 +569,7 @@ class AOAMarkerNode(Node):
         m0.action = Marker.DELETE
         arr.markers.append(m0)
 
-        # Delete all trail lines
+        # 删除 trails（按当前已知数量）
         for idx in range(self._last_published_trail_count):
             m = Marker()
             m.header.frame_id = self.get_parameter('map_frame').value
@@ -445,8 +580,6 @@ class AOAMarkerNode(Node):
             arr.markers.append(m)
 
         self._marker_pub.publish(arr)
-
-    _last_published_trail_count: int = 0
 
 
 def main():
@@ -461,6 +594,10 @@ def main():
             pass
         node.destroy_node()
         rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
 
 ```
 
