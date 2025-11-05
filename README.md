@@ -220,7 +220,7 @@ class AOAMarkerNode(Node):
         self._trails: List[Tuple[Point, Point, float]] = []
 
         # 定时器：箭头刷新 + 轨迹采样
-        self._timer = self.create_timer(1.0, self._tick_arrow)
+        self._timer = self.create_timer(0.1, self._tick_arrow)
         self._trail_timer = self.create_timer(
             float(self.get_parameter('trail_period').value), self._sample_trail
         )
@@ -619,24 +619,44 @@ def generate_launch_description():
             name='aoa_marker_node',
             output='screen',
             parameters=[{
-                # Topics
+                # --- 话题设置 ---
                 'aoa_topic': '/aoa_angle',
                 'snr_topic': '/snr_db',
                 'marker_topic': '/aoa_markers',
 
-                # TX position in the map frame
-                'tx_x': 3.0,
-                'tx_y': 5.0,
+                # --- 几何门限 & TX 位置 ---
+                'tx_x': 1.75991,          # 根据实际 TX 坐标调整
+                'tx_y': 0.602680,
+                'aoa_abs_deg_limit': 25.0,   # AOA 真角度门限 (±20°)
+                'angle_in_degrees': False,    # /aoa_angle 若以度发布，设 True
 
-                # Thresholds
-                'snr_threshold_db': 5.0,
-                'aoa_abs_deg_limit': 30.0,
-
-                # Visualization
+                # --- 箭头外观 ---
                 'arrow_length': 1.0,
-                'trail_length': 10.0,
-                'trail_period': 6.0,
-                'trail_capacity': 20,
+                'shaft_diameter': 0.03,
+                'head_diameter': 0.08,
+                'head_length': 0.15,
+
+                # --- 轨迹采样与渐隐 ---
+                'trail_period': 6.0,              # 每6秒采样一条线
+                'trail_length': 10.0,             # 线段长度（米）
+                'trail_line_width': 0.02,
+                'trail_alpha_max': 0.9,           # 初始不透明度
+                'trail_fade_half_life_sec': 20.0, # 半衰期20秒
+                'trail_max_age_sec': 60.0,        # 超过60秒自动删除
+                'trail_capacity': 10,            # 最多保留200条
+
+                # --- SNR 异常检测 ---
+                'snr_outlier_enable': False,
+                'snr_window_sec': 5.0,
+                'snr_min_samples': 5,
+                'snr_drop_db': 15.0,
+                'snr_k_mad': 2.5,
+                'snr_rel_drop_frac': 0.6,
+                'snr_hold_sec': 0.5,
+
+                # --- TF 相关 ---
+                'map_frame': 'map',
+                'base_frame': 'base_link',
             }]
         ),
     ])
@@ -922,7 +942,6 @@ export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
 
 source /opt/ros/jazzy/setup.bash
 ros2 daemon stop
-ros2 daemon cleanup
 ros2 daemon start
 
 ```
@@ -938,7 +957,6 @@ export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
 
 source /opt/ros/jazzy/setup.bash
 ros2 daemon stop
-ros2 daemon cleanup
 ros2 daemon start
 ```
 
