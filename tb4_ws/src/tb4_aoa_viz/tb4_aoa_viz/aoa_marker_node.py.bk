@@ -1,0 +1,271 @@
+import math
+from collections import deque
+from typing import Optional, Deque, Tuple
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float32
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Point
+from tf2_ros import Buffer, TransformListener
+from builtin_interfaces.msg import Duration
+
+
+class AOAMarkerNode(Node):
+    def __init__(self):
+        super().__init__('aoa_marker_node')
+
+        # ---- Parameters ----
+        self.declare_parameter('aoa_topic', '/aoa_angle')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('arrow_length', 1.0)
+        self.declare_parameter('shaft_diameter', 0.03)
+        self.declare_parameter('head_diameter', 0.08)
+        self.declare_parameter('head_length', 0.15)
+        self.declare_parameter('angle_in_degrees', False)
+        self.declare_parameter('marker_topic', '/aoa_markers')
+
+        # Long-ray (trail) params
+        self.declare_parameter('trail_topic', '/aoa_trails')
+        self.declare_parameter('trail_length', 10.0)          # 长线长度
+        self.declare_parameter('trail_line_width', 0.02)       # 线宽(scale.x)
+        self.declare_parameter('trail_period', 6.0)            # 每隔多少秒采样一次
+        self.declare_parameter('trail_capacity', 20)           # 历史线总数
+        self.declare_parameter('trail_recent_fade_count', 10)  # 最新N条渐隐
+        self.declare_parameter('trail_alpha_min', 0.08)        # 很淡
+        self.declare_parameter('trail_alpha_max', 0.90)        # 最亮（最新）
+
+        aoa_topic = self.get_parameter('aoa_topic').value
+        marker_topic = self.get_parameter('marker_topic').value
+        self._trail_topic = self.get_parameter('trail_topic').value
+
+        # ---- ROS I/O ----
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._aoa_sub = self.create_subscription(Float32, aoa_topic, self._aoa_cb, 10)
+        # 统一用 MarkerArray 发布（RViz 对 Marker 和 MarkerArray 都支持）
+        self._marker_pub = self.create_publisher(MarkerArray, marker_topic, 10)
+
+        # 历史长线也走同一个 topic（一个 MarkerArray 里可同时带箭头和线）
+        # 也可以分 topic；为简单起见同一发布器即可
+        # self._trail_pub = self.create_publisher(MarkerArray, self._trail_topic, 10)
+
+        self._last_angle: Optional[float] = None
+        self._last_tf_ok = False
+
+        # 历史线：保存为 (p0, p1) 的 deque
+        self._trails: Deque[Tuple[Point, Point]] = deque(maxlen=self.get_parameter('trail_capacity').value)
+
+        # 定时器：箭头刷新 + 采样长线
+        self._timer = self.create_timer(0.1, self._tick_arrow)
+        self._trail_timer = self.create_timer(self.get_parameter('trail_period').value, self._sample_trail)
+
+        self.get_logger().info(f'AOA marker listening on {aoa_topic}, publishing {marker_topic}')
+
+    # ---------- Callbacks ----------
+    def _aoa_cb(self, msg: Float32):
+        angle = math.radians(msg.data) if self.get_parameter('angle_in_degrees').value else msg.data
+        self._last_angle = angle
+
+    # ---------- Helpers ----------
+    def _yaw_from_quaternion(self, q):
+        # ZYX yaw from quaternion
+        ysqr = q.y * q.y
+        t3 = 2.0 * (q.w * q.z + q.x * q.y)
+        t4 = 1.0 - 2.0 * (ysqr + q.z * q.z)
+        return math.atan2(t3, t4)
+
+    def _lookup_base_in(self, map_frame: str, base_frame: str):
+        try:
+            tf = self._tf_buffer.lookup_transform(map_frame, base_frame, rclpy.time.Time())
+            self._last_tf_ok = True
+            return tf
+        except Exception as e:
+            if self._last_tf_ok:
+                self.get_logger().warn(f'lookup_transform({map_frame}->{base_frame}) failed once: {e}')
+            self._last_tf_ok = False
+            return None
+
+    # ---------- Publishing ----------
+    def _tick_arrow(self):
+        """实时箭头（ARROW）"""
+        if self._last_angle is None:
+            return
+
+        map_frame = self.get_parameter('map_frame').value
+        base_frame = self.get_parameter('base_frame').value
+        L = self.get_parameter('arrow_length').value
+        shaft_d = self.get_parameter('shaft_diameter').value
+        head_d = self.get_parameter('head_diameter').value
+        head_L = self.get_parameter('head_length').value
+
+        tf = self._lookup_base_in(map_frame, base_frame)
+        if tf is None:
+            return
+
+        x = tf.transform.translation.x
+        y = tf.transform.translation.y
+        base_yaw = self._yaw_from_quaternion(tf.transform.rotation)
+
+        theta = base_yaw + self._last_angle
+        p0 = Point(x=x, y=y, z=0.1)
+        p1 = Point(x=x + L * math.cos(theta), y=y + L * math.sin(theta), z=0.1)
+
+        arrow = Marker()
+        arrow.header.frame_id = map_frame
+        arrow.header.stamp = self.get_clock().now().to_msg()
+        arrow.ns = 'aoa'
+        arrow.id = 0  # 固定 ID（覆盖更新）
+        arrow.type = Marker.ARROW
+        arrow.action = Marker.ADD
+        arrow.points = [p0, p1]
+        arrow.scale.x = shaft_d
+        arrow.scale.y = head_d
+        arrow.scale.z = head_L
+        arrow.color.r = 0.0
+        arrow.color.g = 0.3
+        arrow.color.b = 1.0
+        arrow.color.a = 1.0
+        arrow.lifetime = Duration(sec=0, nanosec=0)  # 永久
+
+        arr = MarkerArray()
+        arr.markers.append(arrow)
+
+        # 也顺带把历史线刷新（颜色渐隐需要持续更新）
+        arr.markers.extend(self._build_trail_markers(map_frame))
+
+        self._marker_pub.publish(arr)
+
+    def _sample_trail(self):
+        """每 trail_period 采样一次，生成一条长线并加入历史"""
+        if self._last_angle is None:
+            return
+
+        map_frame = self.get_parameter('map_frame').value
+        base_frame = self.get_parameter('base_frame').value
+        LL = self.get_parameter('trail_length').value
+
+        tf = self._lookup_base_in(map_frame, base_frame)
+        if tf is None:
+            return
+
+        x = tf.transform.translation.x
+        y = tf.transform.translation.y
+        base_yaw = self._yaw_from_quaternion(tf.transform.rotation)
+        theta = base_yaw + self._last_angle
+
+        p0 = Point(x=x, y=y, z=0.02)  # 线稍微低一点避免盖住箭头
+        p1 = Point(x=x + LL * math.cos(theta), y=y + LL * math.sin(theta), z=0.02)
+
+        self._trails.append((p0, p1))
+
+        # 立即发一次（可选，或等下一次箭头刷新统一发）
+        arr = MarkerArray()
+        arr.markers.extend(self._build_trail_markers(map_frame))
+        self._marker_pub.publish(arr)
+
+    def _build_trail_markers(self, frame_id: str):
+        """根据 _trails 生成 20 条 LINE_LIST，并设置渐隐颜色"""
+        trail_width = self.get_parameter('trail_line_width').value
+        cap = self.get_parameter('trail_capacity').value
+        recent_n = min(self.get_parameter('trail_recent_fade_count').value, cap)
+        alpha_min = self.get_parameter('trail_alpha_min').value
+        alpha_max = self.get_parameter('trail_alpha_max').value
+
+        markers = []
+
+        n = len(self._trails)
+        # 为了稳定 ID 映射：最老的放小 ID，最新的放大 ID
+        # 我们使用 id = 100 + idx，避免与箭头 id=0 冲突
+        for idx, (p0, p1) in enumerate(self._trails):
+            m = Marker()
+            m.header.frame_id = frame_id
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = 'aoa_trails'
+            m.id = 100 + idx
+            m.type = Marker.LINE_LIST
+            m.action = Marker.ADD
+            m.points = [p0, p1]
+            m.scale.x = trail_width  # LINE_LIST 只用 scale.x 作为线宽
+
+            # 颜色：后半段（最老的那部分）固定很淡；最新的 recent_n 条做线性渐隐
+            # deque: 0..n-1 = old..new
+            # old_count = max(0, n - recent_n)
+            old_count = max(0, n - recent_n)
+            if idx < old_count:
+                alpha = alpha_min  # 老的：恒定很淡
+            else:
+                # 在最近 recent_n 内做渐隐：
+                # 令 rank 从 0..recent_n-1（越新 rank 越大），alpha 越高
+                rank = idx - old_count
+                if recent_n > 1:
+                    t = (rank) / (recent_n - 1)
+                else:
+                    t = 1.0
+                alpha = alpha_min + (alpha_max - alpha_min) * t  # 线性插值
+
+            # 颜色你可自定义，这里用橙色系
+            m.color.r = 1.0
+            m.color.g = 0.5
+            m.color.b = 0.0
+            m.color.a = float(alpha)
+
+            m.lifetime = Duration(sec=0, nanosec=0)  # 永久存在，靠重复发布覆盖颜色
+            markers.append(m)
+
+        # 如果曾经发布过更多条（比如从 20 缩到 15），需要删除多余的 ID
+        # 用 DELETE 动作把多余 ID 清理掉
+        if n < self._last_published_trail_count:
+            for idx in range(n, self._last_published_trail_count):
+                m = Marker()
+                m.header.frame_id = frame_id
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = 'aoa_trails'
+                m.id = 100 + idx
+                m.action = Marker.DELETE
+                markers.append(m)
+
+        self._last_published_trail_count = n
+        return markers
+
+    # ---------- ROS2 lifecycle ----------
+    def on_shutdown(self):
+        # 清掉所有 trail
+        arr = MarkerArray()
+        # DELETEALL 不是所有版本都支持，稳妥起见逐个 DELETE
+        for idx in range(self._last_published_trail_count):
+            m = Marker()
+            m.header.frame_id = self.get_parameter('map_frame').value
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = 'aoa_trails'
+            m.id = 100 + idx
+            m.action = Marker.DELETE
+            arr.markers.append(m)
+        # 也删掉箭头
+        m = Marker()
+        m.header.frame_id = self.get_parameter('map_frame').value
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'aoa'
+        m.id = 0
+        m.action = Marker.DELETE
+        arr.markers.append(m)
+
+        self._marker_pub.publish(arr)
+
+    # 初始化之后补一个字段
+    _last_published_trail_count: int = 0
+
+
+def main():
+    rclpy.init()
+    node = AOAMarkerNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        try:
+            node.on_shutdown()
+        except Exception:
+            pass
+        node.destroy_node()
+        rclpy.shutdown()

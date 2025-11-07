@@ -1,0 +1,23 @@
+from launch import LaunchDescription
+from launch_ros.actions import Node
+
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='tb4_aoa_viz',
+            executable='aoa_marker_node',
+            name='aoa_marker_node',
+            output='screen',
+            parameters=[
+                {'angle_in_degrees': False},
+                {'aoa_topic': '/aoa_angle'},
+                {'map_frame': 'map'},
+                {'base_frame': 'base_link'},
+                {'arrow_length': 1.0},
+                {'shaft_diameter': 0.06},
+                {'head_diameter': 0.12},
+                {'head_length': 0.18},
+                {'marker_topic': '/aoa_markers'},
+            ]
+        )
+    ])
