@@ -36,6 +36,8 @@ when reboot the turtlebot, first need to delete a duplicate default gateway, aft
 ```
 # update turtlebot ip route
 sudo ip route del default via 10.33.16.1 dev wlan0
+
+sudo ip route add default via 10.33.16.1 dev wlan0
 ```
 
 The ros2 use the fastDDS server, default at address 192.168.186.1, need to re-assign it, otherwise the fastDDS communication may fail. "ros2 topic list" cannot be seen.
@@ -193,6 +195,19 @@ ros2 param set /aoa_marker_node tx_x 3.27
 ros2 param set /aoa_marker_node tx_y -1.45
 
 ```
+
+### Commend for Reset Odom location
+
+```
+ros2 service call /reset_pose irobot_create_msgs/srv/ResetPose "{}"
+ros2 launch turtlebot4_navigation slam.launch.py
+
+
+# check position
+ros2 run tf2_ros tf2_echo map base_link
+```
+
+
 
 
 
