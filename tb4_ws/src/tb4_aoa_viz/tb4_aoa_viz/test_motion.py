@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # test_motion.py
 #
-# 在 map 坐标系下控制 TurtleBot：
-# 1. 旋转到指定绝对 yaw
-# 2. 沿当前朝向行走指定距离
+# control TurtleBot under the /map：
+# 1. first rotate to global yaw
+# 2. then move forward
 
 import math
 import time
@@ -16,7 +16,7 @@ from motion_simple import MotionSimple, normalize_angle
 from tf2_ros import Buffer, TransformListener, TransformException
 
 
-# ================== TF 工具函数 ================== #
+# tf helpers
 
 def wait_for_tf(tf_buffer: Buffer,
                 executor,
@@ -89,7 +89,7 @@ def get_stable_pose(tf_buffer: Buffer,
     return sum(xs)/len(xs), sum(ys)/len(ys), sum(yaws)/len(yaws)
 
 
-# ================== 在 map 下旋转 ================== #
+# rotate 
 
 def rotate_to_yaw_absolute_map(motion: MotionSimple,
                                executor,
@@ -97,6 +97,16 @@ def rotate_to_yaw_absolute_map(motion: MotionSimple,
                                target_yaw: float,
                                base_angular_speed=0.3,
                                safety_timeout=15.0):
+
+
+    pose0 = get_xy_yaw_from_tf(tf_buffer)
+    if pose0 is None:
+        print("Cannot read TF, cannot move.")
+        return
+
+    x0, y0, yaw0 = pose0
+
+    print(f"[map] Start forward: x={x0:.3f}, y={y0:.3f}, yaw={yaw0:.3f}")
 
     Kp = 2.0
     min_w = 0.05
@@ -135,10 +145,22 @@ def rotate_to_yaw_absolute_map(motion: MotionSimple,
             break
 
     motion.stop()
-    time.sleep(0.5)
+    # time.sleep(0.5)
+
+    time.sleep(2.0)
+
+    pose_end = get_stable_pose(tf_buffer, duration=1.0, rate=30.0)
+    if pose_end:
+        x1, y1, yaw1 = pose_end
+        print(f"[map] End pose: x={x1:.3f}, y={y1:.3f}, yaw={yaw1:.3f}")
+
+        straight = math.hypot(x1 - x0, y1 - y0)
+        print(f"[map] Straight-line distance ≈ {straight:.3f} m \n")
+
+    time.sleep(2.0)
 
 
-# ================== 在 map 下前进 ================== #
+# move forward
 
 def move_forward_distance_map(motion: MotionSimple,
                               executor,
@@ -191,11 +213,11 @@ def move_forward_distance_map(motion: MotionSimple,
             print("\n[map] Forward reached target.")
             break
 
-        # 线速度
+        # linear v
         v = Kv * remaining
         v = max(min(v, max_speed), min_speed)
 
-        # 角速度：保持朝向 yaw0
+        # angular speed
         yaw_err = normalize_angle(yaw0 - yaw)
         w = Kw_yaw*yaw_err + Kw_cross*cross
         w = max(min(w, max_w), -max_w)
@@ -218,10 +240,10 @@ def move_forward_distance_map(motion: MotionSimple,
         straight = math.hypot(x1 - x0, y1 - y0)
         print(f"[map] Straight-line distance ≈ {straight:.3f} m")
 
-    time.sleep(1.0)
+    time.sleep(2.0)
 
 
-# ================== 高层动作序列 ================== #
+# sequence of control
 def run_sequence(first_turn_rad: float,
                  forward_distance_m: float):
 
@@ -242,14 +264,14 @@ def run_sequence(first_turn_rad: float,
     tf_listener = TransformListener(tf_buffer, motion)
 
     try:
-        # 等 TF map->base_link
+        # read baselink from tf
         if not wait_for_tf(tf_buffer, executor,
                            target_frame="map",
                            source_frame="base_link",
                            timeout=20.0):
             return
 
-        # ==== 1) 根据“当前 yaw 和目标 yaw 的差”来决定要不要转 ====
+        # decision to rotate
         pose = get_xy_yaw_from_tf(tf_buffer, "map", "base_link")
         if pose is None:
             print("[seq] Cannot get current yaw from TF.")
@@ -259,7 +281,6 @@ def run_sequence(first_turn_rad: float,
             print(f"[seq] current yaw={yaw_now:.3f}, "
                   f"target={first_turn_rad:.3f}, err={yaw_err:.3f}")
 
-            # 只有“误差”足够大才去旋转，比如大于 1°
             if abs(yaw_err) > math.radians(1.0):
                 rotate_to_yaw_absolute_map(
                     motion,
@@ -272,7 +293,7 @@ def run_sequence(first_turn_rad: float,
             else:
                 print("[seq] Already near target yaw, skip rotation.")
 
-        # ==== 2) 在 map 下前进 ====
+        #  move forward
         if forward_distance_m > 1e-4:
             move_forward_distance_map(
                 motion,
@@ -296,8 +317,8 @@ def run_sequence(first_turn_rad: float,
 
 def main(args=None):
     run_sequence(
-        first_turn_rad=math.pi*0.000,     # 在 map 下的绝对 yaw
-        forward_distance_m=0.2  # 在 map 下走 1m
+        first_turn_rad=math.pi*0.0, 
+        forward_distance_m=0.1  
     )
 
 
