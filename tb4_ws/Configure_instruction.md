@@ -967,3 +967,427 @@ def get_publish_snr_fn(topic: str = "/snr_db") -> Callable[[float], None]:
     """Usage: publish_snr = get_publish_snr_fn(); publish_snr(snr_db)"""
     return _PublishSNRFnHolder.get_publish_snr_fn(topic=topic)
 ```
+
+
+
+### Motion Control
+
+```
+cd ~/tb4_ws/src/tb4_aoa_viz/tb4_aoa_viz
+nano motion_bridge_map.py
+```
+
+
+
+```
+#!/usr/bin/env python3
+# Motion bridge (using map frame) for TurtleBot4.
+#
+# 对外接口：
+#   move_bot = get_move_bot_fn()
+#   move_bot(x_target, y_target, yaw_target)
+#
+# 内部使用 TF 查 map->base_frame 位姿，用 map 坐标系做闭环纠偏。
+
+import math
+import threading
+import time
+from typing import Callable, Optional, Tuple
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+
+from geometry_msgs.msg import Twist
+from tf2_ros import Buffer, TransformListener, TransformException
+
+
+# ================= 工具函数 ================= #
+
+def normalize_angle(angle: float) -> float:
+    """归一化到 (-pi, pi]."""
+    a = math.fmod(angle + math.pi, 2.0 * math.pi)
+    if a <= 0.0:
+        a += 2.0 * math.pi
+    return a - math.pi
+
+
+def quat_to_yaw(x: float, y: float, z: float, w: float) -> float:
+    """从 quaternion 提取 yaw (绕 z 轴)."""
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+# ================= 内部 Node ================= #
+
+class _MotionNode(Node):
+    """
+    - 发布 /cmd_vel
+    - 通过 TF 获取 map->base_frame 的变换 (pose in map)
+    """
+
+    def __init__(
+        self,
+        cmd_vel_topic: str = "/cmd_vel",
+        global_frame: str = "map",
+        base_frame: str = "base_link",   # TB4 常见：base_link 或 base_footprint
+        queue_size: int = 10,
+    ):
+        super().__init__("motion_bridge_map_node")
+
+        self._cmd_pub = self.create_publisher(Twist, cmd_vel_topic, queue_size)
+
+        self._global_frame = global_frame
+        self._base_frame = base_frame
+
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+
+        self._have_tf = threading.Event()
+        self.create_timer(0.1, self._check_tf_once)
+
+    def _check_tf_once(self):
+        if self._have_tf.is_set():
+            return
+        pose = self.get_pose()
+        if pose is not None:
+            self._have_tf.set()
+
+    def wait_for_tf(self, timeout: float = 5.0) -> bool:
+        return self._have_tf.wait(timeout=timeout)
+
+    # --- 关键：通过 TF 拿 map 下的位姿 --- #
+
+    def get_pose(self) -> Optional[Tuple[float, float, float, Tuple[float, float, float, float]]]:
+        """
+        返回 (x, y, yaw, (qx, qy, qz, qw)) in map frame。
+        没拿到 TF 就返回 None。
+        """
+        try:
+            now = rclpy.time.Time()
+            t = self._tf_buffer.lookup_transform(
+                self._global_frame,
+                self._base_frame,
+                now,
+                timeout=rclpy.duration.Duration(seconds=0.2),
+            )
+        except TransformException:
+            return None
+
+        trans = t.transform.translation
+        rot = t.transform.rotation
+
+        x = float(trans.x)
+        y = float(trans.y)
+        qx = float(rot.x)
+        qy = float(rot.y)
+        qz = float(rot.z)
+        qw = float(rot.w)
+        yaw = quat_to_yaw(qx, qy, qz, qw)
+
+        return x, y, yaw, (qx, qy, qz, qw)
+
+    # --- 速度控制 --- #
+
+    def publish_cmd(self, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.angular.z = float(angular_z)
+        self._cmd_pub.publish(msg)
+
+    def stop_robot(self) -> None:
+        self.publish_cmd(0.0, 0.0)
+
+
+# ================= MotionController ================= #
+
+class MotionController:
+    """
+    使用 map 坐标系进行闭环纠偏的控制器。
+
+    外部调用：
+        ctrl = MotionController()
+        ctrl.start()
+        ctrl.move_to(x_target, y_target, yaw_target)
+        ctrl.stop()
+    """
+
+    def __init__(
+        self,
+        cmd_vel_topic: str = "/cmd_vel",
+        global_frame: str = "map",
+        base_frame: str = "base_link",
+    ):
+        self._cmd_vel_topic = cmd_vel_topic
+        self._global_frame = global_frame
+        self._base_frame = base_frame
+
+        self._node: Optional[_MotionNode] = None
+        self._executor: Optional[SingleThreadedExecutor] = None
+        self._thread: Optional[threading.Thread] = None
+        self._started = False
+
+        # 控制参数，可根据 TB4 实机调
+        self.max_ang_vel = 0.6
+        self.max_lin_vel = 0.22
+        self.kp_ang = 1.5
+        self.kp_lin = 0.8
+
+        self.yaw_tol = math.radians(2.0)   # 角度误差容忍
+        self.dist_tol = 0.02               # 距离误差容忍（米）
+
+    # -------- 生命周期管理 -------- #
+
+    def start(self) -> None:
+        if self._started:
+            return
+
+        if not rclpy.ok():
+            rclpy.init()
+
+        self._node = _MotionNode(
+            cmd_vel_topic=self._cmd_vel_topic,
+            global_frame=self._global_frame,
+            base_frame=self._base_frame,
+        )
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+
+        def _spin():
+            try:
+                self._executor.spin()
+            except Exception:
+                pass
+
+        self._thread = threading.Thread(target=_spin, daemon=True)
+        self._thread.start()
+        self._started = True
+
+        if not self._node.wait_for_tf(timeout=5.0):
+            self._node.get_logger().warn(
+                f"TF {self._global_frame} -> {self._base_frame} not available yet."
+            )
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+
+        assert self._node is not None
+        assert self._executor is not None
+
+        self._node.stop_robot()
+        time.sleep(0.1)
+
+        self._executor.remove_node(self._node)
+        self._executor.shutdown()
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+        self._node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+        self._node = None
+        self._executor = None
+        self._thread = None
+        self._started = False
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+
+    # -------- 外部接口：移动到 map 中的目标 pose -------- #
+
+    def move_to(self, x_target: float, y_target: float, yaw_target: float) -> None:
+        """
+        输入：目标 pose in map
+            x_target, y_target (米)
+            yaw_target (弧度)
+
+        步骤：
+          1. 在 map 坐标系下，从当前 (x,y,yaw) 走到 (x_target, y_target)
+          2. 到点后，再旋转到 yaw_target
+        """
+        if not self._started:
+            self.start()
+
+        assert self._node is not None
+
+        pose0 = self._node.get_pose()
+        if pose0 is None:
+            self._node.get_logger().warn("No map pose available; abort move.")
+            return
+
+        x0, y0, yaw0, quat0 = pose0
+        print(
+            f"[MotionController] Start pose in map: "
+            f"x={x0:.3f}, y={y0:.3f}, yaw={yaw0:.3f} rad"
+        )
+
+        # 1) 走到目标 (x_target, y_target)
+        self._move_to_xy(x_target, y_target)
+
+        # 2) 旋转到目标 yaw_target
+        self._rotate_to_yaw(yaw_target)
+
+        # 最终姿态打印
+        posef = self._node.get_pose()
+        if posef is None:
+            print("[MotionController] Final map pose unavailable.")
+            return
+
+        xf, yf, yawf, quatf = posef
+        print(
+            "[MotionController] Final pose in map: "
+            f"x={xf:.3f} m, y={yf:.3f} m, yaw={yawf:.3f} rad "
+            f"({math.degrees(yawf):.1f} deg)"
+        )
+        print(
+            "[MotionController] Final orientation (qx, qy, qz, qw) = "
+            f"({quatf[0]:.3f}, {quatf[1]:.3f}, {quatf[2]:.3f}, {quatf[3]:.3f})"
+        )
+
+    # -------- 低层控制：yaw + xy -------- #
+
+    def _rotate_to_yaw(self, target_yaw: float, timeout: float = 15.0) -> None:
+        assert self._node is not None
+        t_start = time.time()
+
+        target_yaw = normalize_angle(target_yaw)
+
+        while rclpy.ok() and (time.time() - t_start) < timeout:
+            pose = self._node.get_pose()
+            if pose is None:
+                time.sleep(0.01)
+                continue
+
+            _, _, yaw, _ = pose
+            err = normalize_angle(target_yaw - yaw)
+            if abs(err) < self.yaw_tol:
+                break
+
+            w = self.kp_ang * err
+            w = max(-self.max_ang_vel, min(self.max_ang_vel, w))
+            self._node.publish_cmd(0.0, w)
+            time.sleep(0.02)
+
+        self._node.stop_robot()
+        time.sleep(0.05)
+
+    def _move_to_xy(self, target_x: float, target_y: float, timeout: float = 30.0) -> None:
+        """
+        在 map 帧下走到 (target_x, target_y)。
+        用“朝向目标点”的角度做 heading 修正。
+        """
+        assert self._node is not None
+
+        t_start = time.time()
+
+        while rclpy.ok() and (time.time() - t_start) < timeout:
+            pose = self._node.get_pose()
+            if pose is None:
+                time.sleep(0.01)
+                continue
+
+            x, y, yaw, _ = pose
+            dx = target_x - x
+            dy = target_y - y
+            dist = math.sqrt(dx * dx + dy * dy)
+
+            if dist < self.dist_tol:
+                break
+
+            desired_yaw = math.atan2(dy, dx)
+            heading_err = normalize_angle(desired_yaw - yaw)
+
+            # 线速度：距离越远越快，上限 max_lin_vel，下限 0.05
+            v = self.kp_lin * dist
+            v = min(self.max_lin_vel, max(0.05, v))
+
+            # 角速度：纠一点 heading，限制不要太大
+            w = self.kp_ang * heading_err
+            w = max(-0.4, min(0.4, w))
+
+            self._node.publish_cmd(v, w)
+            time.sleep(0.02)
+
+        self._node.stop_robot()
+        time.sleep(0.05)
+
+
+# ================= Convenience：函数接口 ================= #
+
+class _MoveBotFnHolder:
+    _lock = threading.Lock()
+    _controller: Optional[MotionController] = None
+
+    @classmethod
+    def get_move_bot_fn(
+        cls,
+        cmd_vel_topic: str = "/cmd_vel",
+        global_frame: str = "map",
+        base_frame: str = "base_link",
+    ) -> Callable[[float, float, float], None]:
+        """
+        返回函数：
+            move_bot(x_target, y_target, yaw_target)
+        目标 pose 全在 map 坐标系下。
+        """
+        with cls._lock:
+            if cls._controller is None:
+                cls._controller = MotionController(
+                    cmd_vel_topic=cmd_vel_topic,
+                    global_frame=global_frame,
+                    base_frame=base_frame,
+                )
+                cls._controller.start()
+
+        def move_bot(x_target: float, y_target: float, yaw_target: float) -> None:
+            assert cls._controller is not None
+            cls._controller.move_to(x_target, y_target, yaw_target)
+
+        return move_bot
+
+
+def get_move_bot_fn(
+    cmd_vel_topic: str = "/cmd_vel",
+    global_frame: str = "map",
+    base_frame: str = "base_link",
+) -> Callable[[float, float, float], None]:
+    """
+    Usage:
+        from tb4_aoa_viz.motion_bridge_map import get_move_bot_fn
+        move_bot = get_move_bot_fn(base_frame="base_footprint")  # 如使用 base_footprint
+
+        import math
+        # 移动到 map 下 (1.0, 0.5)，朝向 pi/2
+        move_bot(1.0, 0.5, math.pi / 2)
+    """
+    return _MoveBotFnHolder.get_move_bot_fn(
+        cmd_vel_topic=cmd_vel_topic,
+        global_frame=global_frame,
+        base_frame=base_frame,
+    )
+
+```
+
+
+
+### build
+
+```
+cd ~/tb4_ws
+
+# 删除上次编译生成的所有文件夹
+rm -rf build/ install/ log/
+
+# 重新编译全部包
+colcon build
+
+```
+

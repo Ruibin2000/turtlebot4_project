@@ -209,6 +209,23 @@ ros2 run tf2_ros tf2_echo map base_link
 
 
 
+### Commend to control bot moving
+
+```
+# first run the slam
+
+
+source /opt/ros/jazzy/setup.bash
+python3 test_motion.py 
+
+```
+
+
+
+
+
+
+
 
 
 ### Commend for FPV camera stream
