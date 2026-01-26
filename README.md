@@ -46,53 +46,70 @@ The ros2 use the fastDDS server, default at address 192.168.186.1, need to re-as
 
 #### solving the laptop - turtlebot communication problem on ROS2
 
-**on laptop:** start a new fastDDS server 
+**Using the cycloneDDS**: unicast, tcp
 
-one terminal: keep listening
-
-```
-fastdds discovery -i 0
-# default fast dds server port 11811
-```
-
-another terminal
+on laptop:
 
 ```
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_DOMAIN_ID=0
-unset ROS_LOCALHOST_ONLY
-unset CYCLONEDDS_URI
-export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
+nano ~/.cyclonedds/cyclonedds.xml
+```
 
-source /opt/ros/jazzy/setup.bash
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <AllowMulticast>true</AllowMulticast>
+    </General>
+
+    <Discovery>
+      <Peers>
+        <Peer address="192.168.185.3"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+
+```
+
+on turtlebot4:
+
+```
+nano ~/.cyclonedds/cyclonedds.xml
+```
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <!-- 先允许 multicast，保证本机不会被锁死 -->
+      <AllowMulticast>true</AllowMulticast>
+    </General>
+
+    <Discovery>
+      <Peers>
+        <!-- 注意：不要 udp:// 前缀 -->
+        <Peer address="192.168.0.224"/>
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+
+```
+
+
+
+**both restart domain:**
+
+```
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file://$HOME/.cyclonedds/cyclonedds.xml
+unset FASTDDS_DISCOVERY_SERVER FASTDDS_DEFAULT_PROFILES_FILE ROS_AUTOMATIC_DISCOVERY_RANGE ROS_LOCALHOST_ONLY
+
 ros2 daemon stop
 ros2 daemon start
 
-```
-
-**on turtlebot4**
-
-```
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_DOMAIN_ID=0
-unset ROS_LOCALHOST_ONLY
-unset CYCLONEDDS_URI
-export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
-
-source /opt/ros/jazzy/setup.bash
-ros2 daemon stop
-ros2 daemon start
-```
-
-**backup**
-
-```
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_DOMAIN_ID=0
-unset ROS_LOCALHOST_ONLY
-unset CYCLONEDDS_URI
-export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811   # laptop 的固定 IP
-source /opt/ros/jazzy/setup.bash
 ```
 
 
