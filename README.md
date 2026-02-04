@@ -307,6 +307,14 @@ finally:
 ```
 
 
+### Commend for PTU rotation
+
+
+```
+python3 test_ptu.py
+
+```
+
 
 
 
