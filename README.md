@@ -46,9 +46,9 @@ The ros2 use the fastDDS server, default at address 192.168.186.1, need to re-as
 
 #### solving the laptop - turtlebot communication problem on ROS2
 
-**on laptop:** start a new fastDDS server 
+**Using the cycloneDDS**: unicast, tcp
 
-one terminal: keep listening
+on laptop:
 
 ```
 fastdds discovery -i 0 -p 11811
@@ -80,7 +80,7 @@ ros2 daemon start
 
 ```
 
-**on turtlebot4**
+on turtlebot4:
 
 ```
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -89,20 +89,21 @@ unset ROS_LOCALHOST_ONLY
 unset CYCLONEDDS_URI
 #export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
 
-source /opt/ros/jazzy/setup.bash
+```
+
+
+
+
+**both restart domain:**
+
+```
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file://$HOME/.cyclonedds/cyclonedds.xml
+unset FASTDDS_DISCOVERY_SERVER FASTDDS_DEFAULT_PROFILES_FILE ROS_AUTOMATIC_DISCOVERY_RANGE ROS_LOCALHOST_ONLY
+
 ros2 daemon stop
 ros2 daemon start
-```
 
-**backup**
-
-```
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_DOMAIN_ID=0
-unset ROS_LOCALHOST_ONLY
-unset CYCLONEDDS_URI
-export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811   # laptop 的固定 IP
-source /opt/ros/jazzy/setup.bash
 ```
 
 
