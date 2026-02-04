@@ -51,52 +51,46 @@ The ros2 use the fastDDS server, default at address 192.168.186.1, need to re-as
 on laptop:
 
 ```
-nano ~/.cyclonedds/cyclonedds.xml
+fastdds discovery -i 0 -p 11811
+# default fast dds server port 11811
 ```
 
-```
-<?xml version="1.0" encoding="UTF-8"?>
-<CycloneDDS xmlns="https://cdds.io/config">
-  <Domain id="any">
-    <General>
-      <AllowMulticast>true</AllowMulticast>
-    </General>
+another terminal
 
-    <Discovery>
-      <Peers>
-        <Peer address="192.168.185.3"/>
-      </Peers>
-    </Discovery>
-  </Domain>
-</CycloneDDS>
+
+
+```
+source /opt/ros/jazzy/setup.bash
+unset ROS_AUTOMATIC_DISCOVERY_RANGE
+unset ROS_LOCALHOST_ONLY
+unset CYCLONEDDS_URI
+unset ROS_DISCOVERY_SERVER
+```
+
+
+
+```
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_DOMAIN_ID=0
+#unset ROS_LOCALHOST_ONLY
+#unset CYCLONEDDS_URI
+export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
+ros2 daemon stop
+ros2 daemon start
 
 ```
 
 on turtlebot4:
 
 ```
-nano ~/.cyclonedds/cyclonedds.xml
-```
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_DOMAIN_ID=0
+unset ROS_LOCALHOST_ONLY
+unset CYCLONEDDS_URI
+#export FASTDDS_DISCOVERY_SERVER=192.168.0.224:11811
 
 ```
-<?xml version="1.0" encoding="UTF-8"?>
-<CycloneDDS xmlns="https://cdds.io/config">
-  <Domain id="any">
-    <General>
-      <!-- 先允许 multicast，保证本机不会被锁死 -->
-      <AllowMulticast>true</AllowMulticast>
-    </General>
 
-    <Discovery>
-      <Peers>
-        <!-- 注意：不要 udp:// 前缀 -->
-        <Peer address="192.168.0.224"/>
-      </Peers>
-    </Discovery>
-  </Domain>
-</CycloneDDS>
-
-```
 
 
 
@@ -171,12 +165,34 @@ chronyc sources -v
 
 ### Commend for slam & Rviz
 
+turtlebot4 bringup:
+
+```
+source /opt/ros/jazzy/setup.bash
+ros2 launch turtlebot4_bringup robot.launch.py publish_tf:=true
+```
+
+
+
+```
+source /opt/ros/jazzy/setup.bash
+ros2 run tf2_ros tf2_echo odom base_link
+```
+
+
+
 Terminal A1: SLAM
 
 ```
 source /opt/ros/jazzy/setup.bash
 export ROS_DOMAIN_ID=0
 ros2 launch turtlebot4_navigation slam.launch.py
+
+
+source /opt/ros/jazzy/setup.bash
+ros2 launch turtlebot4_navigation slam.launch.py \
+	use_sim_time:=false \
+	autostart:=true
 ```
 
 Terminal A2: RViz
@@ -226,20 +242,69 @@ ros2 run tf2_ros tf2_echo map base_link
 
 
 
+
+
 ### Commend to control bot moving
 
 ```
-# first run the slam
-
+# first run the slam and initialize the odom location
 
 source /opt/ros/jazzy/setup.bash
 python3 test_motion.py 
 
 ```
 
+following are the demo code:
 
 
 
+```
+from map_motion_api import MapMotionAPI
+import math
+import time
+
+api = MapMotionAPI(
+        cmd_topic="/cmd_vel_unstamped",
+        odom_topic="/odom",
+        rate=10.0,
+        max_linear=0.50,
+        max_angular=0.25,
+        source_frame="base_link",      # change to "base_footprint" if your TF uses that
+        lin_accel_limit=0.05,
+        ang_accel_limit=0.8,
+    )
+
+try:
+    x, y, yaw = api.read_pos()
+    # api.move(yaw=math.pi/2, distance=1.0)
+    print(f"before x : {x} \n y : {y} \n yaw : {yaw}")
+    
+    time.sleep(2.0)
+    
+    
+    api.move(yaw=0.0, distance=1.0)
+    
+    time.sleep(2.0)
+    
+    x, y, yaw = api.read_pos()
+    print(f"middle x : {x} \n y : {y} \n yaw : {yaw}")
+    
+    
+    
+    api.move(yaw=math.pi, distance=1.0)
+    
+    time.sleep(2.0)
+    
+    x, y, yaw = api.read_pos()
+    print(f"after x : {x} \n y : {y} \n yaw : {yaw}")
+    
+finally:
+    api.shutdown()
+
+
+
+# ros2 service call /reset_pose irobot_create_msgs/srv/ResetPose "{}"
+```
 
 
 
