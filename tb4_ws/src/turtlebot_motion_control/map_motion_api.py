@@ -7,6 +7,7 @@ A clean, importable API for TurtleBot motion using TF (map->base) + cmd_vel.
 Public API:
   - read_pos() -> (x, y, yaw) in map frame
   - move(yaw, distance) : rotate to absolute yaw in map, then forward distance (m)
+  - compute_yaw_distance_to_target: calculate the yaw and distance moving to the target from current
 
 Requires:
   - motion_simple.py providing MotionSimple and normalize_angle
@@ -347,6 +348,29 @@ class MapMotionAPI:
             return self._forward_distance(distance=distance)
 
         return True
+    
+    def compute_yaw_distance_to_target(
+        self,
+        current_xy: Tuple[float, float],
+        target_xy: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        """
+        Given current (x,y) and target (x,y) in map frame,
+        return (yaw_abs, distance) where:
+          - yaw_abs: absolute yaw in map frame to face target
+          - distance: forward distance to reach target (>=0)
+        """
+        x, y = float(current_xy[0]), float(current_xy[1])
+        tx, ty = float(target_xy[0]), float(target_xy[1])
+
+        dx = tx - x
+        dy = ty - y
+
+        yaw_abs = math.atan2(dy, dx)              # [-pi, pi]
+        yaw_abs = normalize_angle(yaw_abs)
+
+        distance = math.hypot(dx, dy)             # >= 0
+        return yaw_abs, distance
 
 
 # -----------------------------

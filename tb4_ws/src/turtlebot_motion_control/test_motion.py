@@ -14,29 +14,25 @@ api = MapMotionAPI(
     )
 
 try:
-    x, y, yaw = api.read_pos()
+    cur_x, cur_y, yaw = api.read_pos()
     # api.move(yaw=math.pi/2, distance=1.0)
-    print(f"before x : {x} \n y : {y} \n yaw : {yaw}")
+    print(f"before x : {cur_x} \n y : {cur_y} \n yaw : {yaw}")
     
     time.sleep(2.0)
     
     
-    api.move(yaw=0.0, distance=1.0)
+    
+    tgt_pos = [0.0,0.0]
+    
+    mv_yaw, mv_dis = api.compute_yaw_distance_to_target([cur_x,cur_y], tgt_pos)
+    api.move(yaw=mv_yaw, distance=mv_dis)
+    api.move(yaw=0.0, distance=0.0)
     
     time.sleep(2.0)
     
     x, y, yaw = api.read_pos()
     print(f"middle x : {x} \n y : {y} \n yaw : {yaw}")
-    
-    
-    
-    api.move(yaw=math.pi, distance=1.0)
-    
-    time.sleep(2.0)
-    
-    x, y, yaw = api.read_pos()
-    print(f"after x : {x} \n y : {y} \n yaw : {yaw}")
-    
+
 finally:
     api.shutdown()
 

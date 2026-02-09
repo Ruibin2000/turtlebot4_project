@@ -232,6 +232,7 @@ ros2 param set /aoa_marker_node tx_y -1.45
 ### Commend for Reset Odom location
 
 ```
+source /opt/ros/jazzy/setup.bash
 ros2 service call /reset_pose irobot_create_msgs/srv/ResetPose "{}"
 ros2 launch turtlebot4_navigation slam.launch.py
 
