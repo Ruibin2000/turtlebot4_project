@@ -25,6 +25,8 @@ try:
     tgt_pos = [0.0,0.0]
     
     mv_yaw, mv_dis = api.compute_yaw_distance_to_target([cur_x,cur_y], tgt_pos)
+    
+    print("action: yaw: ", mv_yaw, "; distance: ", mv_dis)
     api.move(yaw=mv_yaw, distance=mv_dis)
     api.move(yaw=0.0, distance=0.0)
     
